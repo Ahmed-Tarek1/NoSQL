@@ -167,11 +167,16 @@ class DBClient:
         return winner[1]
 
     def Search(self, query):
-        """Full-text search returning matching keys (AND semantics)."""
+        """Full-text search returning list of (key, score) tuples when available."""
         for node in self.nodes:
             r = self._request(node, {"cmd": "SEARCH", "query": query})
             if r and 'keys' in r:
-                return r['keys']
+                keys = r.get('keys', [])
+                scores = r.get('scores')
+                if scores and len(scores) == len(keys):
+                    return list(zip(keys, scores))
+                # fallback: return keys with score 0.0
+                return [(k, 0.0) for k in keys]
         return []
 
     def SimilarKeys(self, key, k=5):

@@ -1,0 +1,4 @@
+sentence-transformers>=2.2.2
+# Optional: install a compatible PyTorch build for your platform, e.g.:
+# pip install torch --index-url https://download.pytorch.org/whl/cpu
+numpy

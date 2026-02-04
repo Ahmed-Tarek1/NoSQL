@@ -1,4 +1,4 @@
-import asyncio, json, os, random, re, sys, time
+import asyncio, json, os, random, re, sys, time, math
 # Optional pluggable embedding function: provide embeddings.py with compute_embedding(value, key=None)
 compute_embedding_fn = None
 try:
@@ -22,6 +22,10 @@ class TinyDBNode:
         self.embeddings = {}
         # Track which words belong to which keys for proper cleanup
         self.key_to_words = {}
+        # TF/IDF support
+        self.doc_term_freqs = {}   # key -> {term: count}
+        self.term_doc_freqs = {}   # term -> doc freq
+        self.doc_lengths = {}      # key -> total terms
         self._load_from_wal()
 
     def _load_from_wal(self):
@@ -148,10 +152,21 @@ class TinyDBNode:
         if key in self.key_to_words:
             for w in self.key_to_words[key]:
                 if w in self.inverted_index:
-                    self.inverted_index[w].discard(key)
+                    if key in self.inverted_index[w]:
+                        self.inverted_index[w].discard(key)
+                        # decrement term doc freq
+                        if w in self.term_doc_freqs:
+                            self.term_doc_freqs[w] = max(0, self.term_doc_freqs[w] - 1)
+                            if self.term_doc_freqs[w] == 0:
+                                del self.term_doc_freqs[w]
                     if not self.inverted_index[w]:
                         del self.inverted_index[w]
+            # remove tracked words and per-doc termfreqs/lengths
             del self.key_to_words[key]
+        if key in self.doc_term_freqs:
+            del self.doc_term_freqs[key]
+        if key in self.doc_lengths:
+            del self.doc_lengths[key]
         
         # Remove embeddings
         if key in self.embeddings:
@@ -160,10 +175,19 @@ class TinyDBNode:
     def _index_data(self, key, val):
         # Inverted Index for Full Text Search
         words = re.findall(r'\w+', str(val).lower())
-        self.key_to_words[key] = set()
+        # term frequencies for this document
+        tf = {}
         for w in words:
+            tf[w] = tf.get(w, 0) + 1
+        total_terms = len(words)
+        self.doc_term_freqs[key] = tf
+        self.doc_lengths[key] = total_terms
+        self.key_to_words[key] = set(tf.keys())
+        for w in tf.keys():
+            existed = key in self.inverted_index.get(w, set())
             self.inverted_index.setdefault(w, set()).add(key)
-            self.key_to_words[key].add(w)
+            if not existed:
+                self.term_doc_freqs[w] = self.term_doc_freqs.get(w, 0) + 1
         
         # Embedding: use pluggable function when available, else mock deterministic per-key RNG
         if compute_embedding_fn:
@@ -352,19 +376,85 @@ class TinyDBNode:
                 if req['key'] in self.meta:
                     resp["meta"] = self.meta[req['key']]
             elif cmd == "SEARCH":
-                # full-text search: return keys that contain all tokens (AND)
-                q = req.get('query', '')
-                tokens = re.findall(r'\w+', str(q).lower())
-                if not tokens:
-                    resp['keys'] = []
-                else:
+                # Enhanced full-text search:
+                # - support OR ("term1 OR term2" or using |)
+                # - support phrase queries using double quotes: "exact phrase"
+                # - rank results using TF-IDF
+                q_raw = req.get('query', '') or ''
+                q_raw = str(q_raw)
+                # extract phrases
+                phrases = re.findall(r'"([^"]+)"', q_raw)
+                # remove phrases from query text
+                q_no_phrases = re.sub(r'"([^"]+)"', ' ', q_raw)
+
+                # split on OR (case-insensitive) or '|' to form clauses. Within a clause terms are ANDed.
+                clauses = re.split(r'(?i)\s+or\s+|\|', q_no_phrases)
+                clause_results = []
+                all_query_terms = []
+                for cl in clauses:
+                    tokens = re.findall(r'\w+', cl.lower())
+                    if not tokens:
+                        continue
+                    all_query_terms.extend(tokens)
                     sets = [self.inverted_index.get(t, set()) for t in tokens]
                     if not sets:
-                        resp['keys'] = []
-                    else:
-                        # intersection (AND)
-                        res = set.intersection(*sets) if len(sets) > 1 else sets[0]
-                        resp['keys'] = list(res)
+                        continue
+                    # AND within clause
+                    res = set.intersection(*sets) if len(sets) > 1 else sets[0].copy()
+                    clause_results.append(res)
+
+                # If there were clauses, union their results (OR between clauses). Otherwise empty.
+                if clause_results:
+                    candidate_keys = set().union(*clause_results)
+                else:
+                    candidate_keys = set()
+
+                # Apply phrase filtering: require each phrase to appear as substring in the document value
+                if phrases and candidate_keys:
+                    filtered = set()
+                    for k in candidate_keys:
+                        doc_text = str(self.data.get(k, '')).lower()
+                        ok = True
+                        for ph in phrases:
+                            if ph.lower() not in doc_text:
+                                ok = False
+                                break
+                        if ok:
+                            filtered.add(k)
+                    candidate_keys = filtered
+
+                # Ranking: compute TF-IDF score for query terms (including phrase words)
+                # include words from phrases into query terms
+                for ph in phrases:
+                    all_query_terms.extend(re.findall(r'\w+', ph.lower()))
+
+                # dedupe query terms
+                q_terms = list(dict.fromkeys(all_query_terms))
+                N = max(1, len(self.data))
+                scores = {}
+                for k in candidate_keys:
+                    score = 0.0
+                    for term in q_terms:
+                        df = self.term_doc_freqs.get(term, 0)
+                        idf = math.log((N + 1) / (1 + df)) + 1.0
+                        tf = 0.0
+                        if k in self.doc_term_freqs:
+                            denom = self.doc_lengths.get(k, 0) or 1
+                            tf = self.doc_term_freqs[k].get(term, 0) / denom
+                        score += tf * idf
+                    # phrase boost
+                    if phrases:
+                        # give a small boost per matched phrase
+                        for ph in phrases:
+                            if ph.lower() in str(self.data.get(k, '')).lower():
+                                score += 0.5
+                    scores[k] = score
+
+                # sort keys by score desc
+                sorted_keys = sorted(candidate_keys, key=lambda k: scores.get(k, 0.0), reverse=True)
+                resp['keys'] = list(sorted_keys)
+                # include scores aligned with keys for client-side ranking info
+                resp['scores'] = [scores.get(k, 0.0) for k in sorted_keys]
             elif cmd == "SIMILAR":
                 # find top-k similar keys to given key using cosine similarity
                 key = req.get('key')
