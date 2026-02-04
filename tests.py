@@ -321,6 +321,53 @@ def test_conflict_and_convergence():
     print("✅ Conflict resolution and convergence test passed")
 
 
+def test_search_and_embeddings():
+    """Test inverted index search and embedding APIs"""
+    print("\n=== Testing Search and Embeddings ===")
+    db_files = ["idx0.log", "idx1.log", "idx2.log"]
+    for f in db_files:
+        if os.path.exists(f): os.remove(f)
+    ports = [8100, 8101, 8102]
+    procs = []
+    for i, p in enumerate(ports):
+        peers_csv = ",".join(str(x) for x in ports if x != p)
+        procs.append(start_server(p, db_files[i], peers_csv))
+    time.sleep(1.0)
+
+    client = DBClient([("127.0.0.1", p) for p in ports], verify_writes=False)
+    # add documents
+    docs = {
+        'doc1': 'The quick brown fox',
+        'doc2': 'Quick brown dogs leap',
+        'doc3': 'Lazy fox sleeps'
+    }
+    for k, v in docs.items():
+        assert client.Set(k, v, verify=False)
+
+    # search for 'quick brown' should return doc1 and doc2
+    res = client.Search('quick brown')
+    assert 'doc1' in res and 'doc2' in res, f"Search missing results: {res}"
+
+    # test embedding API returns vector
+    emb = client.EmbedValue('hello world')
+    assert isinstance(emb, list) and len(emb) >= 1, "EmbedValue failed"
+
+    # test similarity: pick doc1 neighbors
+    sim = client.SimilarKeys('doc1', k=2)
+    assert isinstance(sim, list), "SimilarKeys failed"
+
+    # cleanup
+    for proc in procs:
+        try:
+            if proc and proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=2)
+        except Exception:
+            pass
+
+    print("✅ Search and embeddings test passed")
+
+
 def test_quorum_requirement():
     """Test that writes require quorum acknowledgment"""
     print("\n=== Testing Quorum Requirement ===")

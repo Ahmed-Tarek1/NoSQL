@@ -166,6 +166,30 @@ class DBClient:
 
         return winner[1]
 
+    def Search(self, query):
+        """Full-text search returning matching keys (AND semantics)."""
+        for node in self.nodes:
+            r = self._request(node, {"cmd": "SEARCH", "query": query})
+            if r and 'keys' in r:
+                return r['keys']
+        return []
+
+    def SimilarKeys(self, key, k=5):
+        """Return top-k similar keys to `key` based on embeddings."""
+        for node in self.nodes:
+            r = self._request(node, {"cmd": "SIMILAR", "key": key, "k": k})
+            if r and 'keys' in r:
+                return r['keys']
+        return []
+
+    def EmbedValue(self, value):
+        """Compute embedding for an arbitrary value (server-side or mock)."""
+        for node in self.nodes:
+            r = self._request(node, {"cmd": "EMBED_VALUE", "value": value})
+            if r and 'embedding' in r:
+                return r['embedding']
+        return None
+
     def Delete(self, key, debug=False, verify=None):
         """Delete a key. `verify` overrides client verify_writes when provided."""
         payload = {"cmd": "DEL", "key": key, "debug": debug}

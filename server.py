@@ -1,4 +1,11 @@
 import asyncio, json, os, random, re, sys, time
+# Optional pluggable embedding function: provide embeddings.py with compute_embedding(value, key=None)
+compute_embedding_fn = None
+try:
+    from embeddings import compute_embedding
+    compute_embedding_fn = compute_embedding
+except Exception:
+    compute_embedding_fn = None
 
 class TinyDBNode:
     def __init__(self, host, port, db_file, peers=None):
@@ -158,9 +165,22 @@ class TinyDBNode:
             self.inverted_index.setdefault(w, set()).add(key)
             self.key_to_words[key].add(w)
         
-        # Fixed: Mock Embedding for Similarity Search using per-key RNG
-        rng = random.Random(hash(key))
-        self.embeddings[key] = [rng.random() for _ in range(128)]
+        # Embedding: use pluggable function when available, else mock deterministic per-key RNG
+        if compute_embedding_fn:
+            try:
+                vec = compute_embedding_fn(val, key=key)
+                if isinstance(vec, (list, tuple)):
+                    self.embeddings[key] = list(vec)
+                else:
+                    # fallback to mock
+                    rng = random.Random(hash(key))
+                    self.embeddings[key] = [rng.random() for _ in range(128)]
+            except Exception:
+                rng = random.Random(hash(key))
+                self.embeddings[key] = [rng.random() for _ in range(128)]
+        else:
+            rng = random.Random(hash(key))
+            self.embeddings[key] = [rng.random() for _ in range(128)]
 
     def _write_wal(self, entry, debug=False):
         if debug and random.random() < 0.05:
@@ -331,6 +351,53 @@ class TinyDBNode:
                 # include meta if available
                 if req['key'] in self.meta:
                     resp["meta"] = self.meta[req['key']]
+            elif cmd == "SEARCH":
+                # full-text search: return keys that contain all tokens (AND)
+                q = req.get('query', '')
+                tokens = re.findall(r'\w+', str(q).lower())
+                if not tokens:
+                    resp['keys'] = []
+                else:
+                    sets = [self.inverted_index.get(t, set()) for t in tokens]
+                    if not sets:
+                        resp['keys'] = []
+                    else:
+                        # intersection (AND)
+                        res = set.intersection(*sets) if len(sets) > 1 else sets[0]
+                        resp['keys'] = list(res)
+            elif cmd == "SIMILAR":
+                # find top-k similar keys to given key using cosine similarity
+                key = req.get('key')
+                topk = int(req.get('k', 5))
+                if key not in self.embeddings:
+                    resp['keys'] = []
+                else:
+                    v = self.embeddings[key]
+                    def dot(a,b):
+                        return sum(x*y for x,y in zip(a,b))
+                    def norm(a):
+                        return sum(x*x for x in a) ** 0.5
+                    nv = norm(v) or 1.0
+                    scores = []
+                    for k2, vec in self.embeddings.items():
+                        if k2 == key: continue
+                        s = dot(v, vec) / (nv * (norm(vec) or 1.0))
+                        scores.append((s, k2))
+                    scores.sort(reverse=True)
+                    resp['keys'] = [k for _, k in scores[:topk]]
+            elif cmd == "EMBED_VALUE":
+                # compute embedding for arbitrary value
+                val = req.get('value')
+                if compute_embedding_fn:
+                    try:
+                        vec = compute_embedding_fn(val)
+                        resp['embedding'] = vec
+                    except Exception:
+                        resp['embedding'] = None
+                else:
+                    # deterministic mock for value
+                    rng = random.Random(hash(str(val)))
+                    resp['embedding'] = [rng.random() for _ in range(128)]
             elif cmd == "HEARTBEAT":
                 resp = {"status": "ok", "port": self.port}
             elif cmd == "ROLE":
