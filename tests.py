@@ -346,7 +346,14 @@ def test_search_and_embeddings():
 
     # search for 'quick brown' should return doc1 and doc2
     res = client.Search('quick brown')
-    assert 'doc1' in res and 'doc2' in res, f"Search missing results: {res}"
+    # client.Search now returns list of (key, score, excerpt)
+    keys = [t[0] for t in res]
+    assert 'doc1' in keys and 'doc2' in keys, f"Search missing results: {res}"
+
+    # check that excerpts contain highlighted matches
+    for k, s, excerpt in res:
+        if k in ('doc1', 'doc2'):
+            assert excerpt is not None and '<em>' in excerpt.lower(), f"Excerpt missing highlight for {k}: {excerpt}"
 
     # test embedding API returns vector
     emb = client.EmbedValue('hello world')
@@ -366,6 +373,43 @@ def test_search_and_embeddings():
             pass
 
     print("✅ Search and embeddings test passed")
+
+
+def test_search_edge_cases():
+    """Unit tests for OR, phrase queries, and TF-IDF ranking."""
+    print("\n=== Testing SEARCH Edge Cases (OR, phrase, TF-IDF) ===")
+    db_file = "edge_idx.log"
+    if os.path.exists(db_file): os.remove(db_file)
+    proc = start_server(8200, db_file)
+    time.sleep(0.5)
+    client = DBClient([("127.0.0.1", 8200)], verify_writes=False)
+
+    docs = {
+        'a': 'apple apple apple banana',
+        'b': 'apple banana',
+        'c': 'orange fruit salad',
+        'd': 'the quick brown fox jumps'
+    }
+    for k, v in docs.items():
+        assert client.Set(k, v, verify=False)
+
+    # OR query: 'orange OR apple' should include both 'a','b','c'
+    res = client.Search('orange OR apple')
+    keys = [t[0] for t in res]
+    assert 'a' in keys and 'b' in keys and 'c' in keys, f"OR query failed: {keys}"
+
+    # Phrase query: exact phrase should match
+    assert any(t[0] == 'd' for t in client.Search('"quick brown"')) , "Phrase query failed"
+
+    # TF-IDF ranking: document 'a' has higher tf for 'apple' than 'b'
+    res = client.Search('apple')
+    if len(res) >= 2:
+        # Expect 'a' to rank above 'b'
+        keys = [t[0] for t in res]
+        assert keys.index('a') <= keys.index('b'), f"TF-IDF ranking unexpected: {res}"
+
+    stop_server(proc, True)
+    print("✅ SEARCH edge cases tests passed")
 
 
 def test_quorum_requirement():

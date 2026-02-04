@@ -173,10 +173,19 @@ class DBClient:
             if r and 'keys' in r:
                 keys = r.get('keys', [])
                 scores = r.get('scores')
+                excerpts = r.get('excerpts')
+                results = []
                 if scores and len(scores) == len(keys):
-                    return list(zip(keys, scores))
+                    if excerpts and len(excerpts) == len(keys):
+                        for k, s, e in zip(keys, scores, excerpts):
+                            results.append((k, s, e))
+                        return results
+                    else:
+                        return [(k, s, None) for k, s in zip(keys, scores)]
                 # fallback: return keys with score 0.0
-                return [(k, 0.0) for k in keys]
+                if excerpts and len(excerpts) == len(keys):
+                    return [(k, 0.0, e) for k, e in zip(keys, excerpts)]
+                return [(k, 0.0, None) for k in keys]
         return []
 
     def SimilarKeys(self, key, k=5):

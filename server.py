@@ -455,6 +455,50 @@ class TinyDBNode:
                 resp['keys'] = list(sorted_keys)
                 # include scores aligned with keys for client-side ranking info
                 resp['scores'] = [scores.get(k, 0.0) for k in sorted_keys]
+                # build excerpts/snippets with highlighted matches
+                excerpts = []
+                # prepare simple case-insensitive highlight replacer
+                def highlight(text, matches):
+                    t = str(text)
+                    # find and replace matches with <em>...</em>, avoid overlapping issues by lower-casing
+                    low = t.lower()
+                    spans = []
+                    for m in matches:
+                        mm = str(m).lower()
+                        idx = low.find(mm)
+                        if idx >= 0:
+                            spans.append((idx, idx + len(mm)))
+                    if not spans:
+                        return t[:200]
+                    # merge spans
+                    spans.sort()
+                    merged = [spans[0]]
+                    for s in spans[1:]:
+                        if s[0] <= merged[-1][1]:
+                            merged[-1] = (merged[-1][0], max(merged[-1][1], s[1]))
+                        else:
+                            merged.append(s)
+                    out = []
+                    last = 0
+                    for a, b in merged:
+                        out.append(t[last:a])
+                        out.append("<em>" + t[a:b] + "</em>")
+                        last = b
+                    out.append(t[last: last + 200])
+                    return ''.join(out)
+
+                for k in sorted_keys:
+                    doc_text = str(self.data.get(k, ''))
+                    matches = []
+                    # prefer phrases
+                    if phrases:
+                        for ph in phrases:
+                            matches.append(ph)
+                    # add query terms
+                    matches.extend(q_terms)
+                    excerpt = highlight(doc_text, matches)
+                    excerpts.append(excerpt)
+                resp['excerpts'] = excerpts
             elif cmd == "SIMILAR":
                 # find top-k similar keys to given key using cosine similarity
                 key = req.get('key')
