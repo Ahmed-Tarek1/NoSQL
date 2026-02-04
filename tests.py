@@ -145,6 +145,10 @@ def durability_test_with_random_kill():
 
     print(f"  Acked: {len(acked)}, Lost after restart: {len(lost)}")
     
+    # show lost keys for debugging
+    if lost:
+        print("  Lost keys:", lost)
+
     # FIXED: Add assertion to fail test on data loss
     assert len(lost) == 0, f"Durability violated: {len(lost)} acknowledged writes were lost!"
     
@@ -218,18 +222,13 @@ def test_replication_and_failover():
 
     client = DBClient([("127.0.0.1", p) for p in ports])
 
-    # find primary
-    primary = client.find_primary()
-    assert primary is not None, "Should have elected a primary"
-    print(f"✓ Primary elected: port {primary[1]}")
-
-    # write some keys to primary
+    # write some keys (writes can go to any node in leaderless mode)
     print("  Writing 20 keys...")
     for i in range(20):
         assert client.Set(f"k{i}", f"v{i}"), f"Failed to write key k{i}"
     print("✓ All writes succeeded")
 
-    # Verify replication
+    # Verify replication: each node should have the key
     time.sleep(0.5)
     for port in ports:
         test_client = DBClient([("127.0.0.1", port)])
@@ -237,97 +236,35 @@ def test_replication_and_failover():
         assert val == "v0", f"Node {port} should have replicated data"
     print("✓ Data replicated to all nodes")
 
-    # kill primary
-    pk = primary[1]
-    print(f"  Killing primary on port {pk}...")
-    primary_proc_idx = ports.index(pk)
+    # kill one node
+    kill_idx = 0
+    kill_port = ports[kill_idx]
+    print(f"  Killing node on port {kill_port}...")
     try:
-        os.kill(procs[primary_proc_idx].pid, signal.SIGKILL)
-        # Wait for process to fully die
+        os.kill(procs[kill_idx].pid, signal.SIGKILL)
         for _ in range(10):
-            if procs[primary_proc_idx].poll() is not None:
+            if procs[kill_idx].poll() is not None:
                 break
             time.sleep(0.1)
-        procs[primary_proc_idx] = None  # Mark as dead
-        print(f"  Primary process killed")
+        procs[kill_idx] = None
+        print(f"  Node {kill_port} killed")
     except Exception as e:
-        print(f"  Warning: Error killing primary: {e}")
+        print(f"  Warning: Error killing node: {e}")
 
-    # Wait for port to be fully released
-    print(f"  Waiting for port {pk} to close...")
-    if wait_for_port_closed(pk, timeout=3.0):
-        print(f"  Port {pk} confirmed closed")
-    else:
-        print(f"  Warning: Port {pk} may still be partially open")
+    # Wait for port to close
+    print(f"  Waiting for port {kill_port} to close...")
+    wait_for_port_closed(kill_port, timeout=3.0)
 
-    # Give nodes time to detect failure - election runs every 0.5s
-    print("  Waiting for election to complete...")
-    time.sleep(1.5)  # At least 3 election cycles
-
-    # wait for election (poll ROLE on remaining nodes for new primary)
-    print("  Polling for new primary election...")
-    new_primary = None
-    deadline = time.time() + 8.0  # Increased timeout
-    remaining_ports = [p for p in ports if p != pk]
-    
-    attempts = 0
-    while time.time() < deadline:
-        attempts += 1
-        for rp in remaining_ports:
-            try:
-                import socket, json
-                s = socket.create_connection(('127.0.0.1', rp), timeout=0.5)
-                payload = json.dumps({'cmd': 'ROLE'}).encode()
-                s.sendall(len(payload).to_bytes(4, 'big') + payload)
-                # read 4-byte header then payload
-                header = s.recv(4)
-                if not header:
-                    s.close()
-                    continue
-                length = int.from_bytes(header, 'big')
-                raw = b""
-                while len(raw) < length:
-                    chunk = s.recv(length - len(raw))
-                    if not chunk:
-                        break
-                    raw += chunk
-                s.close()
-                if raw:
-                    obj = json.loads(raw.decode())
-                    role = obj.get('role')
-                    leader_port = obj.get('leader_port')
-                    term = obj.get('term', 0)
-                    if attempts <= 3:  # Debug first few attempts
-                        print(f"    Port {rp}: role={role}, leader_port={leader_port}, term={term}")
-                    # Node should report being primary AND have a different leader than killed primary
-                    if role == 'primary' and leader_port != pk:
-                        new_primary = ("127.0.0.1", rp)
-                        break
-            except Exception as e:
-                if attempts <= 3:
-                    print(f"    Port {rp}: connection failed - {e}")
-                continue
-        if new_primary:
-            break
-        time.sleep(0.5)  # Check less frequently
-    
-    assert new_primary is not None, f"New primary should be elected within 8 seconds (remaining ports: {remaining_ports})"
-    assert new_primary != primary, f"New primary {new_primary} should be different from old primary {primary}"
-    print(f"✓ New primary elected: port {new_primary[1]}")
-
-    # Verify all data is still accessible
-    print("  Verifying data integrity after failover...")
-    client._primary_cache = None  # Clear cache
+    # Verify existing data still accessible and new writes succeed (quorum of 2/3)
+    print("  Verifying data integrity and new writes after node failure...")
     for i in range(20):
         val = client.Get(f"k{i}")
-        assert val == f"v{i}", f"Missing k{i} after failover (expected 'v{i}', got {val})"
-    print("✓ All data intact after failover")
-    
-    # Write new data to new primary
-    print("  Writing new data to new primary...")
+        assert val == f"v{i}", f"Missing k{i} after node failure"
+
+    # New writes should still succeed with 2/3 nodes up
     for i in range(20, 25):
-        assert client.Set(f"k{i}", f"v{i}"), f"Failed to write k{i} to new primary"
-    print("✓ New writes successful on new primary")
+        assert client.Set(f"k{i}", f"v{i}"), f"Failed to write k{i} after node failure"
+    print("✓ New writes successful after node failure")
 
     # cleanup remaining procs
     for proc in procs:
@@ -360,24 +297,22 @@ def test_quorum_requirement():
     time.sleep(1.5)
 
     client = DBClient([("127.0.0.1", p) for p in ports])
-    
-    # Find and verify primary
-    primary = client.find_primary()
-    assert primary is not None
-    print(f"✓ Primary on port {primary[1]}")
-    
     # Write should succeed with all nodes up (quorum: 2/3)
     assert client.Set("test_key", "test_value"), "Write should succeed with all nodes"
     print("✓ Write succeeded with full cluster")
     
     # Kill one secondary - writes should still succeed (quorum: 2/3 still possible)
-    secondaries = [p for p in ports if p != primary[1]]
-    killed_port = secondaries[0]
-    killed_idx = ports.index(killed_port)
-    print(f"  Killing secondary on port {killed_port}...")
+    # Kill one node (any) - writes should still succeed with quorum
+    killed_idx = 0
+    killed_port = ports[killed_idx]
+    print(f"  Killing node on port {killed_port}...")
     try:
         os.kill(procs[killed_idx].pid, signal.SIGKILL)
-        procs[killed_idx].wait()
+        for _ in range(10):
+            if procs[killed_idx].poll() is not None:
+                break
+            time.sleep(0.1)
+        procs[killed_idx] = None
     except Exception:
         pass
     

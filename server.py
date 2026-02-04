@@ -1,41 +1,44 @@
-import asyncio, json, os, random, re, sys
-from collections import defaultdict
+import asyncio, json, os, random, re, sys, time
 
 class TinyDBNode:
     def __init__(self, host, port, db_file, peers=None):
         self.host, self.port, self.db_file = host, port, db_file
         # peers: list of (host, port)
         self.peers = peers or []
-        # role: 'primary' or 'secondary'
-        self.role = 'secondary'
-        # leader port if known
-        self.leader_port = None
-        # term number for split-brain prevention
-        self.term = 0
-        self.failure_count = defaultdict(int)
-        # initialize leader deterministically (lowest port)
-        try:
-            all_ports = [self.port] + [p for _, p in self.peers]
-            self.leader_port = min(all_ports)
-            self.role = 'primary' if self.leader_port == self.port else 'secondary'
-        except Exception:
-            self.leader_port = self.port
-            self.role = 'primary'
+        # Leaderless mode: every node can accept writes.
+        # We assign a per-node sequence and per-entry version for conflict resolution.
+        self.seq = 0
+        # metadata per key: version tuple {'ts': float, 'node': port, 'seq': int}
+        self.meta = {}
         self.data = {}
-        self.inverted_index = {} 
+        self.inverted_index = {}
         self.embeddings = {}
         # Track which words belong to which keys for proper cleanup
         self.key_to_words = {}
         self._load_from_wal()
 
     def _load_from_wal(self):
-        if not os.path.exists(self.db_file): return
-        with open(self.db_file, "r") as f:
-            for line in f:
-                try:
-                    entry = json.loads(line)
-                    self._apply_to_memory(entry)
-                except: continue
+        if not os.path.exists(self.db_file):
+            return
+        # Read framed WAL: 4-byte big-endian length + payload
+        try:
+            with open(self.db_file, "rb") as f:
+                while True:
+                    header = f.read(4)
+                    if not header or len(header) < 4:
+                        break
+                    length = int.from_bytes(header, "big")
+                    payload = f.read(length)
+                    if not payload or len(payload) < length:
+                        # incomplete record at EOF - stop
+                        break
+                    try:
+                        entry = json.loads(payload.decode())
+                        self._apply_to_memory(entry)
+                    except Exception:
+                        continue
+        except Exception:
+            return
 
     def _apply_to_memory(self, entry):
         cmd = entry.get('cmd')
@@ -44,17 +47,25 @@ class TinyDBNode:
             # Clean up old indexes for this key if it exists
             self._cleanup_indexes(key)
             self.data[key] = val
+            # store meta if provided
+            if isinstance(entry.get('_meta'), dict):
+                self.meta[key] = entry['_meta']
             self._index_data(key, val)
         elif cmd == "DEL":
             key = entry['key']
             if key in self.data:
                 del self.data[key]
+            if key in self.meta:
+                del self.meta[key]
             # remove from indexes properly
             self._cleanup_indexes(key)
         elif cmd == "BULK":
             for k, v in entry['data']:
                 self._cleanup_indexes(k)
                 self.data[k] = v
+                # store per-key meta if present on entry
+                if isinstance(entry.get('_meta'), dict):
+                    self.meta[k] = entry['_meta']
                 self._index_data(k, v)
 
     def _cleanup_indexes(self, key):
@@ -85,12 +96,41 @@ class TinyDBNode:
         self.embeddings[key] = [rng.random() for _ in range(128)]
 
     def _write_wal(self, entry, debug=False):
-        if debug and random.random() < 0.05: return False 
-        line = json.dumps(entry) + "\n"
-        with open(self.db_file, "a") as f:
-            f.write(line)
-            f.flush()
-            os.fsync(f.fileno()) 
+        if debug and random.random() < 0.05:
+            return False
+
+        payload = json.dumps(entry).encode()
+        framed = len(payload).to_bytes(4, "big") + payload
+
+        flags = os.O_WRONLY | os.O_CREAT | getattr(os, 'O_APPEND', 0)
+        try:
+            fd = os.open(self.db_file, flags, 0o644)
+            try:
+                # ensure full write in a loop to avoid partial writes
+                total = len(framed)
+                written = 0
+                while written < total:
+                    n = os.write(fd, framed[written:])
+                    if n is None or n == 0:
+                        raise OSError("write returned 0")
+                    written += n
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except Exception:
+            return False
+
+        # fsync parent directory to persist file metadata
+        try:
+            dirpath = os.path.dirname(self.db_file) or '.'
+            dfd = os.open(dirpath, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except Exception:
+            pass
+
         return True
 
     async def _replicate_to_secondaries(self, entry, timeout=0.5):
@@ -119,7 +159,7 @@ class TinyDBNode:
                 asyncio.open_connection(host, port),
                 timeout=timeout
             )
-            payload = json.dumps({"cmd": "REPL_APPEND", "entry": entry, "term": self.term, "leader_port": self.leader_port, "sender_port": self.port}).encode()
+            payload = json.dumps({"cmd": "REPL_APPEND", "entry": entry, "sender_port": self.port}).encode()
             writer.write(len(payload).to_bytes(4, "big") + payload)
             await writer.drain()
             
@@ -152,96 +192,16 @@ class TinyDBNode:
             response = json.loads(response_bytes.decode())
             writer.close()
             await writer.wait_closed()
-            self.failure_count[p] = 0
             return True
         except Exception:
-            self.failure_count[p] += 1
-            writer_close = locals().get('writer')
-            if writer_close:
-                writer_close.close()
-                await writer_close.wait_closed()
-            return self.failure_count[p] < 3  # tolerate 3 consecutive failures
-
-    async def _get_alive_ports(self):
-        alive = []
-
-        # ✅ Self is always alive
-        alive.append(self.port)
-
-        for h, p in self.peers:
             try:
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(h, p), timeout=0.3
-                )
-                # Use framed format: 4-byte length prefix + JSON
-                payload = json.dumps({"cmd": "HEARTBEAT"}).encode()
-                writer.write(len(payload).to_bytes(4, "big") + payload)
-                await writer.drain()
-                # Read framed response
-                header = await asyncio.wait_for(reader.readexactly(4), timeout=0.3)
-                length = int.from_bytes(header, "big")
-                await asyncio.wait_for(reader.readexactly(length), timeout=0.3)
                 writer.close()
                 await writer.wait_closed()
-                alive.append(p)
             except Exception:
-                continue
-
-        return alive
-    async def _leader_alive(self):
-        if self.leader_port is None:
+                pass
             return False
 
-        # ✅ If I'm the leader, I'm alive
-        if self.leader_port == self.port:
-            return True
-
-        try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(self.host, self.leader_port),
-                timeout=0.3
-            )
-            # Use framed format: 4-byte length prefix + JSON
-            payload = json.dumps({"cmd": "HEARTBEAT"}).encode()
-            writer.write(len(payload).to_bytes(4, "big") + payload)
-            await writer.drain()
-            # Read framed response
-            header = await asyncio.wait_for(reader.readexactly(4), timeout=0.3)
-            length = int.from_bytes(header, "big")
-            await asyncio.wait_for(reader.readexactly(length), timeout=0.3)
-            writer.close()
-            await writer.wait_closed()
-            return True
-        except Exception:
-            return False
-    
-    async def _election_loop(self):
-        while True:
-            leader_alive = await self._leader_alive()
-
-            # 🔥 Trigger election ONLY if leader is dead
-            if not leader_alive:
-                alive = await self._get_alive_ports()
-
-                if alive:
-                    new_leader = min(alive)
-
-                    if new_leader != self.leader_port:
-                        old_role = self.role
-                        self.leader_port = new_leader
-                        self.role = (
-                            "primary" if self.port == new_leader else "secondary"
-                        )
-                        # If we just became primary, bump term and announce to peers
-                        if self.role == "primary" and old_role != "primary":
-                            self.term += 1
-                            asyncio.create_task(self._announce_leader())
-                        print(
-                            f"[ELECTION] New leader elected: {self.leader_port} "
-                            f"(I am {self.role}, term={self.term})"
-                        )
-
-            await asyncio.sleep(0.5)
+    # In leaderless mode we don't perform leader election; nodes accept writes and replicate
 
     async def handle_client(self, reader, writer):
         try:
@@ -256,72 +216,57 @@ class TinyDBNode:
             resp = {"status": "ok"}
 
             if cmd in ["SET", "BULK"]:
-                # only primary accepts client writes
-                if self.role != 'primary':
-                    resp = {"status": "error", "why": "not_primary", "leader_port": self.leader_port}
-                else:
-                    if self._write_wal(req, req.get('debug', False)):
-                        self._apply_to_memory(req)
-                        # replicate to secondaries with quorum check
-                        acks, total = await self._replicate_to_secondaries(req)
-                        # For single-node, total=0, quorum should be 1
-                        # For 3-node, total=2, quorum should be 2 (majority of 3)
-                        quorum = (total + 2) // 2
-                        if acks + 1 >= quorum:  # +1 for self
-                            resp = {"status": "ok", "acks": acks, "total": total}
-                        else:
-                            resp = {"status": "error", "why": "quorum_not_met", "acks": acks, "total": total}
+                # Leaderless: accept writes on any node. Tag entry with per-entry metadata for conflict resolution.
+                if '_meta' not in req or not isinstance(req.get('_meta'), dict):
+                    req['_meta'] = {'ts': time.time(), 'node': self.port, 'seq': self.seq}
+                    self.seq += 1
+                if self._write_wal(req, req.get('debug', False)):
+                    self._apply_to_memory(req)
+                    # replicate to peers and require quorum
+                    acks, total = await self._replicate_to_secondaries(req)
+                    quorum = (total + 2) // 2
+                    if acks + 1 >= quorum:
+                        resp = {"status": "ok", "acks": acks, "total": total}
                     else:
-                        resp = {"status": "error", "why": "wal_failed"}
+                        resp = {"status": "error", "why": "quorum_not_met", "acks": acks, "total": total}
+                else:
+                    resp = {"status": "error", "why": "wal_failed"}
             elif cmd == "DEL":
-                # allow deletes only on primary for client requests
-                if self.role != 'primary':
-                    resp = {"status": "error", "why": "not_primary", "leader_port": self.leader_port}
-                else:
-                    if self._write_wal(req, req.get('debug', False)):
-                        self._apply_to_memory(req)
-                        acks, total = await self._replicate_to_secondaries(req)
-                        quorum = (total + 2) // 2
-                        if acks + 1 >= quorum:
-                            resp = {"status": "ok", "acks": acks, "total": total}
-                        else:
-                            resp = {"status": "error", "why": "quorum_not_met", "acks": acks, "total": total}
+                if '_meta' not in req or not isinstance(req.get('_meta'), dict):
+                    req['_meta'] = {'ts': time.time(), 'node': self.port, 'seq': self.seq}
+                    self.seq += 1
+                if self._write_wal(req, req.get('debug', False)):
+                    self._apply_to_memory(req)
+                    acks, total = await self._replicate_to_secondaries(req)
+                    quorum = (total + 2) // 2
+                    if acks + 1 >= quorum:
+                        resp = {"status": "ok", "acks": acks, "total": total}
                     else:
-                        resp = {"status": "error", "why": "wal_failed"}
+                        resp = {"status": "error", "why": "quorum_not_met", "acks": acks, "total": total}
+                else:
+                    resp = {"status": "error", "why": "wal_failed"}
             elif cmd == "REPL_APPEND":
                 entry = req.get('entry')
-                term = req.get('term', 0)
-                incoming_leader = req.get('leader_port')
                 if entry:
-                    # Accept replication from higher or equal term
-                    if term >= self.term:
-                        ok = self._write_wal(entry, False)
-                        if ok:
-                            self._apply_to_memory(entry)
-                            # Update leader info from replication message
-                            if incoming_leader:
-                                self.leader_port = incoming_leader
-                                self.role = 'primary' if self.port == self.leader_port else 'secondary'
-                            self.term = term
-                            resp = {"status": "ok"}
-                        else:
-                            resp = {"status": "error", "why": "wal_failed"}
+                    ok = self._write_wal(entry, False)
+                    if ok:
+                        self._apply_to_memory(entry)
+                        resp = {"status": "ok"}
                     else:
-                        resp = {"status": "error", "why": "stale_term"}
+                        resp = {"status": "error", "why": "wal_failed"}
             elif cmd == "ANNOUNCE":
-                incoming_leader = req.get('leader_port')
-                term = req.get('term', 0)
-                if incoming_leader:
-                    self.leader_port = incoming_leader
-                    self.term = term
-                    self.role = 'primary' if self.port == self.leader_port else 'secondary'
+                # ANNOUNCE is a no-op in leaderless mode
                 resp = {"status": "ok"}
             elif cmd == "GET":
-                resp["val"] = self.data.get(req['key'])
+                val = self.data.get(req['key'])
+                resp["val"] = val
+                # include meta if available
+                if req['key'] in self.meta:
+                    resp["meta"] = self.meta[req['key']]
             elif cmd == "HEARTBEAT":
-                resp = {"status": "ok", "role": self.role, "port": self.port, "term": self.term}
+                resp = {"status": "ok", "port": self.port}
             elif cmd == "ROLE":
-                resp = {"status": "ok", "role": self.role, "leader_port": self.leader_port, "term": self.term}
+                resp = {"status": "ok", "port": self.port, "cluster_size": len(self.peers) + 1}
 
             out = json.dumps(resp, default=list).encode()
             writer.write(len(out).to_bytes(4, "big") + out)
@@ -332,40 +277,6 @@ class TinyDBNode:
                 await writer.wait_closed()
             except Exception:
                 pass
-
-    async def _send_announce(self, host, port, timeout=0.5):
-        try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port),
-                timeout=timeout
-            )
-            payload = json.dumps({"cmd": "ANNOUNCE", "leader_port": self.leader_port, "term": self.term, "sender_port": self.port}).encode()
-            writer.write(len(payload).to_bytes(4, "big") + payload)
-            await writer.drain()
-            
-            # read framed response
-            header = await asyncio.wait_for(reader.readexactly(4), timeout=timeout)
-            length = int.from_bytes(header, "big")
-            raw = await asyncio.wait_for(reader.readexactly(length), timeout=timeout)
-            
-            writer.close()
-            await writer.wait_closed()
-            
-            if raw:
-                resp = json.loads(raw.decode())
-                return resp.get('status') == 'ok'
-            return False
-        except Exception:
-            return False
-    
-    async def _announce_leader(self):
-        tasks = []
-        for h, p in self.peers:
-            if h == self.host and p == self.port:
-                continue
-            tasks.append(self._send_announce(h, p))
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def run(self):
         while True:
@@ -383,10 +294,7 @@ class TinyDBNode:
                     await asyncio.sleep(0.05)  # backoff
                 else:
                     raise
-        print(f"Node started on {self.port} (role={self.role}, term={self.term})")
-        # start election loop
-        loop = asyncio.get_event_loop()
-        loop.create_task(self._election_loop())
+        print(f"Node started on {self.port} (leaderless mode, peers={len(self.peers)})")
 
         try:
             async with server:
