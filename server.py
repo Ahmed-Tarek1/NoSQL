@@ -1,5 +1,4 @@
 import asyncio, json, os, random, re, sys
-import numpy as np
 
 class TinyDBNode:
     def __init__(self, host, port, db_file):
@@ -84,10 +83,32 @@ class TinyDBNode:
             await writer.wait_closed()
 
     async def run(self):
-        server = await asyncio.start_server(self.handle_client, self.host, self.port)
+        while True:
+            try:
+                server = await asyncio.start_server(
+                    self.handle_client,
+                    self.host,
+                    self.port,
+                    reuse_address=True,
+                    reuse_port=True
+                )
+                break
+            except OSError as e:
+                if e.errno == 48:
+                    await asyncio.sleep(0.05)  # backoff
+                else:
+                    raise
         print(f"Node started on {self.port}")
-        async with server:
-            await server.serve_forever()
+
+        try:
+            async with server:
+                await server.serve_forever()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            server.close()
+            await server.wait_closed()
+
 
 if __name__ == "__main__":
     # Usage: python server.py <port> <db_file>
