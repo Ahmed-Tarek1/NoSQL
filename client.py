@@ -41,6 +41,28 @@ class DBClient:
                 return json.loads(raw.decode())
         except Exception as e:
             return None
+    def _compare_vc(self, a, b):
+        if not a and not b:
+            return 0
+        a = a or {}
+        b = b or {}
+        greater = False
+        less = False
+        keys = set(list(a.keys()) + list(b.keys()))
+        for k in keys:
+            av = a.get(k, 0)
+            bv = b.get(k, 0)
+            if av > bv:
+                greater = True
+            elif av < bv:
+                less = True
+        if greater and not less:
+            return 1
+        if less and not greater:
+            return -1
+        if not greater and not less:
+            return 0
+        return 2
     def _write_with_retry(self, payload, max_retries=3, verify=None):
         """Try to send the write to any node in the cluster until success or retries exhausted.
 
@@ -99,26 +121,50 @@ class DBClient:
 
     def Get(self, key):
         """Get a value by key - tries all nodes for availability"""
-        # Query all nodes and pick the latest value according to returned meta
-        best = (None, None)  # (meta, val)
+        # Query all nodes and pick the latest value according to vector clocks
+        responses = []  # tuples (node, val, vc)
         for n in self.nodes:
             r = self._request(n, {"cmd": "GET", "key": key})
             if not r:
                 continue
             val = r.get('val')
+            vc = None
             meta = r.get('meta')
-            if meta is None and val is None:
-                continue
-            if meta is None:
-                # treat unknown meta as very old
-                meta = {'ts': 0, 'node': 0, 'seq': 0}
-            if best[0] is None:
-                best = (meta, val)
-                continue
-            # compare by timestamp, then node, then seq
-            if (meta.get('ts', 0), meta.get('node', 0), meta.get('seq', 0)) > (best[0].get('ts', 0), best[0].get('node', 0), best[0].get('seq', 0)):
-                best = (meta, val)
-        return best[1]
+            if isinstance(meta, dict) and isinstance(meta.get('vc'), dict):
+                vc = meta.get('vc')
+            responses.append((n, val, vc))
+
+        if not responses:
+            return None
+
+        # pick a winner
+        winner = responses[0]
+        for tup in responses[1:]:
+            cmp = self._compare_vc(tup[2], winner[2])
+            if cmp == 1:
+                winner = tup
+            elif cmp == 2:
+                # concurrent - deterministic tie-breaker: pick max (node, seq) pair
+                def max_pair(vc):
+                    if not vc: return (0, 0)
+                    items = [(int(n), vc[n]) for n in vc]
+                    return max(items)
+                wp = max_pair(winner[2])
+                tp = max_pair(tup[2])
+                if tp > wp:
+                    winner = tup
+
+        # read-repair: write winner back to nodes with older vc
+        w_node, w_val, w_vc = winner
+        for n, val, vc in responses:
+            if self._compare_vc(w_vc, vc) == 1:
+                # repair
+                try:
+                    self._request(n, {"cmd": "REPL_APPEND", "entry": {"cmd": "SET", "key": key, "val": w_val, "_vc": w_vc}})
+                except Exception:
+                    pass
+
+        return winner[1]
 
     def Delete(self, key, debug=False, verify=None):
         """Delete a key. `verify` overrides client verify_writes when provided."""

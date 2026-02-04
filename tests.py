@@ -278,6 +278,49 @@ def test_replication_and_failover():
     print("✅ Replication and failover test passed")
 
 
+def test_conflict_and_convergence():
+    """Test concurrent conflicting writes and convergence via read-repair"""
+    print("\n=== Testing Conflict Resolution and Convergence ===")
+    db_files = ["conf0.log", "conf1.log", "conf2.log"]
+    for f in db_files:
+        if os.path.exists(f): os.remove(f)
+    ports = [8000, 8001, 8002]
+    procs = []
+    for i, p in enumerate(ports):
+        peers_csv = ",".join(str(x) for x in ports if x != p)
+        procs.append(start_server(p, db_files[i], peers_csv))
+    time.sleep(1.0)
+
+    # Write conflicting values to different nodes concurrently
+    c1 = DBClient([("127.0.0.1", 8000)], verify_writes=False)
+    c2 = DBClient([("127.0.0.1", 8001)], verify_writes=False)
+    assert c1.Set("conflict", "A", verify=False)
+    assert c2.Set("conflict", "B", verify=False)
+
+    # Read from cluster and ensure a deterministic winner and that nodes converge
+    cluster_client = DBClient([("127.0.0.1", p) for p in ports])
+    val = cluster_client.Get("conflict")
+    assert val in ("A", "B"), f"Unexpected value {val}"
+
+    # After read, read-repair should have propagated the winner. Verify all nodes have same value
+    time.sleep(0.2)
+    for p in ports:
+        tc = DBClient([("127.0.0.1", p)])
+        v = tc.Get("conflict")
+        assert v == val, f"Node {p} did not converge (got {v}, expected {val})"
+
+    # cleanup
+    for proc in procs:
+        try:
+            if proc and proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=2)
+        except Exception:
+            pass
+
+    print("✅ Conflict resolution and convergence test passed")
+
+
 def test_quorum_requirement():
     """Test that writes require quorum acknowledgment"""
     print("\n=== Testing Quorum Requirement ===")

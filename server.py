@@ -40,19 +40,71 @@ class TinyDBNode:
         except Exception:
             return
 
+    def _compare_vc(self, a, b):
+        """Compare two vector clocks a and b.
+        Return 1 if a > b, -1 if a < b, 0 if equal, 2 if concurrent.
+        """
+        if not a and not b:
+            return 0
+        a = a or {}
+        b = b or {}
+        greater = False
+        less = False
+        keys = set(list(a.keys()) + list(b.keys()))
+        for k in keys:
+            av = a.get(k, 0)
+            bv = b.get(k, 0)
+            if av > bv:
+                greater = True
+            elif av < bv:
+                less = True
+        if greater and not less:
+            return 1
+        if less and not greater:
+            return -1
+        if not greater and not less:
+            return 0
+        return 2
+
     def _apply_to_memory(self, entry):
         cmd = entry.get('cmd')
         if cmd == "SET":
             key, val = entry['key'], entry['val']
             # Clean up old indexes for this key if it exists
+            old_vc = None
+            if key in self.meta and isinstance(self.meta[key].get('vc'), dict):
+                old_vc = self.meta[key]['vc']
+            incoming_vc = entry.get('_vc') if isinstance(entry.get('_vc'), dict) else None
+            cmp = self._compare_vc(incoming_vc, old_vc)
+            if cmp == -1:
+                # incoming is older - ignore
+                return
+            if cmp == 2:
+                # concurrent - deterministic tie-breaker: choose higher (node,seq) pair
+                # pick the max (node, seq) from incoming_vc and old_vc
+                def max_pair(vc):
+                    if not vc: return (0, 0)
+                    items = [(int(n), vc[n]) for n in vc]
+                    return max(items)
+                in_pair = max_pair(incoming_vc)
+                old_pair = max_pair(old_vc)
+                if in_pair < old_pair:
+                    return
+            # apply
             self._cleanup_indexes(key)
             self.data[key] = val
-            # store meta if provided
-            if isinstance(entry.get('_meta'), dict):
-                self.meta[key] = entry['_meta']
+            if incoming_vc:
+                self.meta[key] = {'vc': incoming_vc}
             self._index_data(key, val)
         elif cmd == "DEL":
             key = entry['key']
+            old_vc = None
+            if key in self.meta and isinstance(self.meta[key].get('vc'), dict):
+                old_vc = self.meta[key]['vc']
+            incoming_vc = entry.get('_vc') if isinstance(entry.get('_vc'), dict) else None
+            cmp = self._compare_vc(incoming_vc, old_vc)
+            if cmp == -1:
+                return
             if key in self.data:
                 del self.data[key]
             if key in self.meta:
@@ -60,12 +112,27 @@ class TinyDBNode:
             # remove from indexes properly
             self._cleanup_indexes(key)
         elif cmd == "BULK":
+            incoming_vc = entry.get('_vc') if isinstance(entry.get('_vc'), dict) else None
             for k, v in entry['data']:
+                old_vc = None
+                if k in self.meta and isinstance(self.meta[k].get('vc'), dict):
+                    old_vc = self.meta[k]['vc']
+                cmp = self._compare_vc(incoming_vc, old_vc)
+                if cmp == -1:
+                    continue
+                if cmp == 2:
+                    def max_pair(vc):
+                        if not vc: return (0, 0)
+                        items = [(int(n), vc[n]) for n in vc]
+                        return max(items)
+                    in_pair = max_pair(incoming_vc)
+                    old_pair = max_pair(old_vc)
+                    if in_pair < old_pair:
+                        continue
                 self._cleanup_indexes(k)
                 self.data[k] = v
-                # store per-key meta if present on entry
-                if isinstance(entry.get('_meta'), dict):
-                    self.meta[k] = entry['_meta']
+                if incoming_vc:
+                    self.meta[k] = {'vc': incoming_vc}
                 self._index_data(k, v)
 
     def _cleanup_indexes(self, key):
@@ -216,10 +283,11 @@ class TinyDBNode:
             resp = {"status": "ok"}
 
             if cmd in ["SET", "BULK"]:
-                # Leaderless: accept writes on any node. Tag entry with per-entry metadata for conflict resolution.
-                if '_meta' not in req or not isinstance(req.get('_meta'), dict):
-                    req['_meta'] = {'ts': time.time(), 'node': self.port, 'seq': self.seq}
+                # Leaderless: accept writes on any node. Tag entry with vector-clock for conflict resolution.
+                if '_vc' not in req or not isinstance(req.get('_vc'), dict):
+                    # increment local counter
                     self.seq += 1
+                    req['_vc'] = {str(self.port): self.seq}
                 if self._write_wal(req, req.get('debug', False)):
                     self._apply_to_memory(req)
                     # replicate to peers and require quorum
@@ -232,9 +300,9 @@ class TinyDBNode:
                 else:
                     resp = {"status": "error", "why": "wal_failed"}
             elif cmd == "DEL":
-                if '_meta' not in req or not isinstance(req.get('_meta'), dict):
-                    req['_meta'] = {'ts': time.time(), 'node': self.port, 'seq': self.seq}
+                if '_vc' not in req or not isinstance(req.get('_vc'), dict):
                     self.seq += 1
+                    req['_vc'] = {str(self.port): self.seq}
                 if self._write_wal(req, req.get('debug', False)):
                     self._apply_to_memory(req)
                     acks, total = await self._replicate_to_secondaries(req)
