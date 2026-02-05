@@ -1,11 +1,21 @@
 import asyncio, json, os, random, re, sys, time, math
-# Optional pluggable embedding function: provide embeddings.py with compute_embedding(value, key=None)
+# Embedding provider selection:
+# - If running in CI or SIMPLE_EMBEDDINGS env var is set, prefer `mock_embeddings`.
+# - Otherwise try to import a real `embeddings.py` provider if present.
 compute_embedding_fn = None
-try:
-    from embeddings import compute_embedding
-    compute_embedding_fn = compute_embedding
-except Exception:
-    compute_embedding_fn = None
+if os.environ.get('CI') or os.environ.get('SIMPLE_EMBEDDINGS'):
+    try:
+        from mock_embeddings import compute_embedding
+        compute_embedding_fn = compute_embedding
+    except Exception:
+        compute_embedding_fn = None
+
+if compute_embedding_fn is None:
+    try:
+        from embeddings import compute_embedding
+        compute_embedding_fn = compute_embedding
+    except Exception:
+        compute_embedding_fn = None
 
 class TinyDBNode:
     def __init__(self, host, port, db_file, peers=None):
